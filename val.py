@@ -75,7 +75,12 @@ def evaluate(fuse_out_folder):
     testloader = DataLoader(
         test_dataset, batch_size=1, shuffle=False, num_workers=cfg.num_workers, collate_fn=test_dataset.__collate_fn__, pin_memory=True
     )
-    metric_result = [AverageMeter() for _ in range(6)]
+    # 定义所有指标的名称列表
+    metric_names = ['EN', 'SF', 'MI', 'SCD', 'VIFF', 'Qabf']
+    metric_result = [AverageMeter() for _ in range(len(metric_names))]
+    
+    # 存储每张图片的指标值
+    per_image_metrics = {}
 
     logging.info(f'evaluating images ...')
     iter = tqdm(testloader, total=len(testloader), ncols=80)
@@ -83,58 +88,81 @@ def evaluate(fuse_out_folder):
     for data_ir, data_vi, _, img_name in iter:
         ir = data_ir.numpy().squeeze() * 255
         vi = data_vi.numpy().squeeze() * 255
-        fi = img_read(os.path.join(fuse_out_folder, img_name[0]), 'L').numpy().squeeze() * 255
+        fi_path = os.path.join(fuse_out_folder, img_name[0])
+        fi = img_read(fi_path, 'L').numpy().squeeze() * 255
         h, w = fi.shape
         if h // 2 != 0 or w // 2 != 0:
             fi = fi[: h // 2 * 2, : w // 2 * 2]
         if fi.shape != ir.shape or fi.shape != vi.shape:
             fi = cv2.resize(fi, (ir.shape[1], ir.shape[0]))
         # print(ir.shape, vi.shape, fi.shape)
-        metric_result[0].update(Evaluator.EN(fi))
-        metric_result[1].update(Evaluator.SD(fi))
-        metric_result[2].update(Evaluator.SF(fi))
-        metric_result[3].update(Evaluator.MI(fi, ir, vi))
-        metric_result[4].update(Evaluator.VIFF(fi, ir, vi))
-        metric_result[5].update(Evaluator.Qabf(fi, ir, vi))
+        
+        # 计算各项指标
+        en_val = Evaluator.EN(fi)
+        sf_val = Evaluator.SF(fi)
+        mi_val = Evaluator.MI(fi, ir, vi)
+        scd_val = Evaluator.SCD(fi, ir, vi)
+        viff_val = Evaluator.VIFF(fi, ir, vi)
+        qabf_val = Evaluator.Qabf(fi, ir, vi)
+        
+        # 更新平均值
+        metric_result[0].update(en_val)
+        metric_result[1].update(sf_val)
+        metric_result[2].update(mi_val)
+        metric_result[3].update(scd_val)
+        metric_result[4].update(viff_val)
+        metric_result[5].update(qabf_val)
+        
+        # 存储每张图片的指标值
+        per_image_metrics[img_name[0]] = [en_val, sf_val, mi_val, scd_val, viff_val, qabf_val]
 
-    # 结果写入文件
+#    # 输出每张图片的指标值
+#    print("\n" * 2 + "-" * 80)
+#    print("Per-image results:")
+#    # 打印表头
+#    header = "Image_Name\t\t" + "\t".join(metric_names)
+#    print(header)
+#    # 打印每张图片的指标值
+#    for img_name, metrics in per_image_metrics.items():
+#        result_line = f'{img_name[:15]:<15}\t' + "\t".join([str(np.round(val, 3)) for val in metrics])
+#        print(result_line)
+#    print("-" * 80)
+    
+    # 结果写入主结果文件（平均值）
     with open(f'{fuse_out_folder}_result.txt', 'w') as f:
-        f.write('EN: ' + str(np.round(metric_result[0].avg, 3)) + '\n')
-        f.write('SD: ' + str(np.round(metric_result[1].avg, 3)) + '\n')
-        f.write('SF: ' + str(np.round(metric_result[2].avg, 3)) + '\n')
-        f.write('MI: ' + str(np.round(metric_result[3].avg, 3)) + '\n')
-        f.write('VIF: ' + str(np.round(metric_result[4].avg, 3)) + '\n')
-        f.write('Qabf: ' + str(np.round(metric_result[5].avg, 3)) + '\n')
+        for i, name in enumerate(metric_names):
+            f.write(f'{name}: ' + str(np.round(metric_result[i].avg, 3)) + '\n')
+    
+    # 将每张图片的指标值写入单独的文件
+    per_img_result_file = f'{fuse_out_folder}_per_img_result.txt'
+    with open(per_img_result_file, 'w') as f:
+        # 写入表头
+        f.write("Image_Name\t" + "\t".join(metric_names) + "\n")
+        # 写入每张图片的指标值
+        for img_name, metrics in per_image_metrics.items():
+            f.write(f'{img_name}\t' + "\t".join([str(np.round(val, 6)) for val in metrics]) + "\n")
 
     logging.info(f'writing results done!')
     print("\n" * 2 + "=" * 80)
-    print("The test result :")
-    print("\t\t EN\t SD\t SF\t MI\tVIF\tQabf")
-    print(
-        'result:\t'
-        + '\t'
-        + str(np.round(metric_result[0].avg, 3))
-        + '\t'
-        + str(np.round(metric_result[1].avg, 3))
-        + '\t'
-        + str(np.round(metric_result[2].avg, 3))
-        + '\t'
-        + str(np.round(metric_result[3].avg, 3))
-        + '\t'
-        + str(np.round(metric_result[4].avg, 3))
-        + '\t'
-        + str(np.round(metric_result[5].avg, 3))
-    )
+    print("Average test result :")
+    # 打印指标名称行
+    header = "\t\t" + "\t".join(metric_names)
+    print(header)
+    # 打印结果行
+    result_line = "result:\t" + "\t".join([str(np.round(metric_result[i].avg, 3)) for i in range(len(metric_names))])
+    print(result_line)
     print("=" * 80)
+    
+    print(f'Per-image results saved to: {per_img_result_file}')
 
 
 if __name__ == "__main__":
     config = yaml.safe_load(open('configs/cfg.yaml'))
     cfg = from_dict(config)
     parse = argparse.ArgumentParser()
-    parse.add_argument('--ckpt_path', type=str, default=f'models/model-MSRS_1216_epoch200.pth')
+    parse.add_argument('--ckpt_path', type=str, default=f'models/model-MSRS_over_epoch200.pth')
     parse.add_argument('--dataset_name', type=str, default=cfg.dataset_name)
-    parse.add_argument('--out_dir', type=str, default=f'test_result/MSRS_1216_稳定版')
+    parse.add_argument('--out_dir', type=str, default=f'test_result/MSRS_per')
     parse.add_argument('--mode', type=str, default='gray')
     args = parse.parse_args()
 
