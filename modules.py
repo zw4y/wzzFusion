@@ -21,16 +21,51 @@ def ifft2(amp, pha):
     return torch.abs(img).unsqueeze(1)
 
 
-# ========================== Tokenizer (3x3 unfold) ==========================
+# ========================== VIS 低光增强（Path B：暗区增强） ==========================
+class LowLightEnhance(nn.Module):
+    """
+    Dark-region-only curve enhancement (Zero-DCE style, Path B)
+    - Pixel-wise soft dark mask
+    - Only enhances truly dark regions
+    - Preserves mid/bright edges (Qabf/SF friendly)
+    Assumes input in [0,1]
+    """
+    def __init__(self, curve_num: int = 8):
+        super().__init__()
+        self.curve_num = curve_num
+        self.curve_net = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(32, curve_num, 3, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,1,H,W) in [0,1]
+
+        # ===== 核心修改：像素级暗区 soft mask =====
+        # x < 0.35 → 强增强
+        # x > 0.5  → 几乎不增强
+        dark_mask = torch.sigmoid(10.0 * (0.35 - x))
+
+        A = self.curve_net(x) * dark_mask
+        out = x
+        for i in range(self.curve_num):
+            out = out + A[:, i:i+1] * out * (1.0 - out)
+
+        return torch.clamp(out, 0.0, 1.0)
+
+
+# ========================== Tokenizer ==========================
 class Tokenizer(nn.Module):
     def __init__(self, patch_size=3):
         super().__init__()
-        self.unfold = nn.Unfold(kernel_size=patch_size, stride=1, padding=patch_size//2)
+        self.unfold = nn.Unfold(kernel_size=patch_size, stride=1, padding=patch_size // 2)
 
     def forward(self, x):
         b, c, h, w = x.shape
-        tokens = self.unfold(x)              # (B, C*p*p, L)
-        tokens = tokens.transpose(1, 2)      # (B, L, C*p*p)
+        tokens = self.unfold(x)
+        tokens = tokens.transpose(1, 2)
         return tokens, b, h, w
 
 
@@ -77,6 +112,8 @@ class DetailFeatureExtraction(nn.Module):
 class DMRM(nn.Module):
     def __init__(self, in_ch=1, out_ch=32, dim=64):
         super().__init__()
+
+        # ===== Stem =====
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, dim, 3, padding=1), nn.GELU(),
             nn.Conv2d(dim, dim, 3, padding=1), nn.GELU(),
@@ -84,46 +121,55 @@ class DMRM(nn.Module):
 
         self.tokenizer = Tokenizer(patch_size=3)
 
+        # ===== Projection =====
         self.vis_proj = nn.Conv2d(dim, dim, 1)
         self.ir_proj = nn.Conv2d(dim, dim, 1)
-        self.joint_proj = nn.Conv2d(dim*2, dim, 1)
+        self.joint_proj = nn.Conv2d(dim * 2, dim, 1)
 
+        # ===== Similarity-driven weight map =====
         self.weight_map = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(),
             nn.Conv2d(16, 16, 3, padding=1), nn.ReLU(),
             nn.Conv2d(16, 1, 3, padding=1), nn.Sigmoid()
         )
 
-        # INN for uncertainty refinement
+        # ===== INN refinement =====
         self.inn_refine = DetailFeatureExtraction(num_layers=3, dim=dim)
 
+        # ===== Output heads =====
         self.out = nn.Conv2d(dim, out_ch, 1)
         self.res = nn.Conv2d(in_ch, out_ch, 1)
 
-        # 可学习参数
-        self.beta = nn.Parameter(torch.tensor(0.08))   # SDM 权重
-        self.gamma = nn.Parameter(torch.tensor(0.08))  # Frequency Guidance 权重
-        self.tau = nn.Parameter(torch.tensor(0.4))     # 可学习不确定阈值（更强！）
+        # ===== Learnable scalars =====
+        self.beta = nn.Parameter(torch.tensor(0.08))    # SDM weight
+        self.gamma = nn.Parameter(torch.tensor(0.08))   # Frequency guidance weight
+        self.tau = nn.Parameter(torch.tensor(0.4))      # Uncertainty threshold
 
-        # 频率域特征对齐投影
-        self.freq_align = nn.Conv2d(out_ch, dim, 1)     # frefus (out_ch) → dim
+        # ===== Frequency alignment =====
+        self.freq_align = nn.Conv2d(out_ch, dim, 1)
 
     def forward(self, ir, vi, frefus):
+        """
+        ir, vi:   (B,1,H,W)
+        frefus:   (B,out_ch,H,W)  frequency-domain fused features
+        """
+
+        # ===== Stem features =====
         ir_f = self.stem(ir)
         vi_f = self.stem(vi)
 
-        # Token 相似度结构对齐
+        # ===== Token similarity =====
         ir_tok, b, H, W = self.tokenizer(ir_f)
         vi_tok, _, _, _ = self.tokenizer(vi_f)
 
         ir_norm = F.normalize(ir_tok, dim=-1)
         vi_norm = F.normalize(vi_tok, dim=-1)
         sim = torch.sum(ir_norm * vi_norm, dim=-1, keepdim=True)
-        sim_map = sim.transpose(1, 2).reshape(b, 1, H, W)  # (B,1,H,W)
+        sim_map = sim.transpose(1, 2).reshape(b, 1, H, W)   # (B,1,H,W)
 
-        # 三分支融合
+        # ===== Branch weighting =====
         vis_w = self.weight_map(sim_map)
-        ir_w = 1 - vis_w
+        ir_w = 1.0 - vis_w
 
         vis_branch = self.vis_proj(vi_f) * vis_w
         ir_branch = self.ir_proj(ir_f) * ir_w
@@ -131,22 +177,33 @@ class DMRM(nn.Module):
 
         f_spatial_raw = vis_branch + ir_branch + 0.5 * joint_branch
 
-        # SDM 只在低相似区域注入（更聪明）
+        # ===== SDM (difference injection only in low-sim regions) =====
         sdm = torch.abs(ir_f - vi_f)
-        f_spatial = f_spatial_raw + self.beta * sdm * (1 - sim_map)
+        f_spatial = f_spatial_raw + self.beta * sdm * (1.0 - sim_map)
 
-        # 频率域一致性引导（加对齐投影！）
-        freq_guidance = self.freq_align(frefus)  # (B,out_ch,H,W) → (B,dim,H,W)
-        guidance = 1 + self.gamma * F.normalize(freq_guidance, dim=1)
+        # ============================================================
+        # ★ MODIFIED PART: Frequency guidance × uncertainty
+        # ============================================================
+
+        # Frequency alignment
+        freq_guidance = self.freq_align(frefus)
+        freq_guidance = F.normalize(freq_guidance, dim=1)
+
+        # Uncertainty (low similarity → high confidence for refinement)
+        conf = torch.sigmoid(5.0 * (self.tau - sim_map))   # (B,1,H,W)
+
+        # Frequency-guided modulation (only on uncertain regions)
+        guidance = 1.0 + self.gamma * freq_guidance * conf
         f_spatial_guided = f_spatial * guidance
 
-        # soft confidence mask（梯度友好）
-        conf = torch.sigmoid(5 * (self.tau - sim_map))   # soft [0,1]
+        # ============================================================
+
+        # ===== INN refinement (only on uncertain regions) =====
         refine_region = self.inn_refine(f_spatial_guided * conf)
-        pass_region = f_spatial_guided * (1 - conf)
+        pass_region = f_spatial_guided * (1.0 - conf)
         f_spatial_refined = refine_region + pass_region
 
-        # 输出头 + 残差
+        # ===== Output =====
         feat = self.out(f_spatial_refined) + self.res(ir)
         return feat, feat
 
@@ -169,8 +226,8 @@ class DecoupledHLFuse(nn.Module):
         )
         self.pha_adjust = nn.Conv2d(2, 2, 3, padding=1, bias=False)
         self.refine = nn.Sequential(
-            nn.Conv2d(1, channel*2, 3, padding=1), nn.GELU(),
-            nn.Conv2d(channel*2, channel, 3, padding=1), nn.GELU(),
+            nn.Conv2d(1, channel * 2, 3, padding=1), nn.GELU(),
+            nn.Conv2d(channel * 2, channel, 3, padding=1), nn.GELU(),
             nn.Conv2d(channel, channel, 1), nn.ReLU(inplace=True)
         )
 
@@ -181,7 +238,7 @@ class DecoupledHLFuse(nn.Module):
             torch.linspace(-1, 1, w, device=ir_amp.device),
             indexing='ij'
         )
-        dist = torch.sqrt(xx**2 + yy**2)
+        dist = torch.sqrt(xx ** 2 + yy ** 2)
         low_mask = torch.sigmoid(60 * (self.cutoff.clamp(0.05, 0.45) - dist))
         low_mask = low_mask.unsqueeze(0).unsqueeze(0)
         high_mask = 1.0 - low_mask
@@ -219,8 +276,8 @@ class FuseBlock(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(dim, mid_ch, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(mid_ch, mid_ch*2, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(mid_ch*2, mid_ch, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, mid_ch * 2, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch * 2, mid_ch, 3, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(mid_ch, 1, 3, padding=1),
             nn.Tanh()
         )
@@ -232,23 +289,21 @@ class FuseBlock(nn.Module):
         return out
 
 
-# ========================== 主网络（关键：DMRM forward 传 frefus）==========================
+# ========================== 主网络 ==========================
 class FusionNet(nn.Module):
     def __init__(self, channel=32):
         super().__init__()
         self.channel = channel
+        self.llie = LowLightEnhance(curve_num=8)
         self.dmrm = DMRM(in_ch=1, out_ch=channel)
         self.freq_fuse = DecoupledHLFuse(channel=channel)
-        self.fuse_block = FuseBlock(dim=channel*3)
+        self.fuse_block = FuseBlock(dim=channel * 3)
 
     def forward(self, ir, vi):
+        vi = self.llie(vi)
         ir_amp, ir_pha = fft2(ir)
         vi_amp, vi_pha = fft2(vi)
-
         frefus, fused_amp, fused_pha = self.freq_fuse(ir_amp, ir_pha, vi_amp, vi_pha)
-
-        # 关键：把 frefus 传进空间域，实现频率引导
         ir_feat, vi_feat = self.dmrm(ir, vi, frefus)
-
         fusion = self.fuse_block(ir_feat, vi_feat, frefus)
         return fusion, fused_amp, fused_pha
