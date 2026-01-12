@@ -106,6 +106,20 @@ class MSRS(Dataset):
         img_name = self.img_list[index]
         ir_img = img_read(os.path.join(self.ir_path, img_name), mode='L')
         vi_img, vi_cbcr = img_read(os.path.join(self.vi_path, img_name), mode='YCbCr')
+        # ===== 强制转 float + 归一化到 [0,1]（关键）=====
+        if ir_img.dtype != torch.float32:
+            ir_img = ir_img.float()
+        if vi_img.dtype != torch.float32:
+            vi_img = vi_img.float()
+
+        # 若 img_read 返回 [0,255]，这一步是必要的
+        if ir_img.max() > 1.0:
+            ir_img = ir_img / 255.0
+        if vi_img.max() > 1.0:
+            vi_img = vi_img / 255.0
+
+        ir_img = ir_img.clamp(0.0, 1.0)
+        vi_img = vi_img.clamp(0.0, 1.0)
         if self.mode == 'train':
             mask = img_read(os.path.join(self.mask_path, img_name), mode='L')
         else:
