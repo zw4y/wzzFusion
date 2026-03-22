@@ -1,4 +1,5 @@
 import os
+
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
@@ -7,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from modules import FusionNet
-from utils.loss import PixelGradLoss, cal_saliency_loss, cal_fre_loss
+from utils.loss import PixelGradLoss, cal_saliency_loss, cal_fre_loss, cal_sf_loss, cal_freq_hf_loss, EnhanceLoss
 from utils.get_params_group import get_param_groups
 import kornia
 from kornia.metrics import AverageMeter
@@ -34,7 +35,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True      # 加上这个能加速训练
+    torch.backends.cudnn.benchmark = True  # 加上这个能加速训练
 
 
 def train(cfg_path, wb_key):
@@ -54,7 +55,7 @@ def train(cfg_path, wb_key):
 
     # ==================== Model ====================
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    fuse_net = FusionNet(channel=16)           # 减少通道数从32到16以节省内存
+    fuse_net = FusionNet(channel=16)
     fuse_net.to(device)
     fuse_net.train()
 
@@ -70,6 +71,7 @@ def train(cfg_path, wb_key):
     # ==================== Loss ====================
     loss_ssim = kornia.losses.SSIMLoss(window_size=11)
     loss_grad_pixel = PixelGradLoss()
+    loss_enhance = EnhanceLoss(patch_size=16, mean_val=0.5)
 
     # ==================== Data ====================
     train_d = getattr(dataset, cfg.dataset_name)
@@ -78,7 +80,7 @@ def train(cfg_path, wb_key):
     trainloader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
-        shuffle=True,                         # 关键：必须打乱！
+        shuffle=True,  # 关键：必须打乱！
         num_workers=cfg.num_workers,
         collate_fn=train_dataset.__collate_fn__ if hasattr(train_dataset, '__collate_fn__') else None,
         pin_memory=True,
@@ -98,6 +100,9 @@ def train(cfg_path, wb_key):
         ssim_loss_meter = AverageMeter()
         saliency_loss_meter = AverageMeter()
         fre_loss_meter = AverageMeter()
+        sf_loss_meter = AverageMeter()
+        freq_hf_loss_meter = AverageMeter()
+        enhance_loss_meter = AverageMeter()
 
         iter_bar = tqdm(trainloader, total=len(trainloader), ncols=100)
         for i, (data_ir, data_vi, mask, _) in enumerate(iter_bar):
@@ -107,7 +112,7 @@ def train(cfg_path, wb_key):
 
             # 使用autocast包装前向传播
             with autocast():
-                fus_data, amp, pha = fuse_net(data_ir, data_vi)   # 完美兼容
+                fus_data, amp, pha, high_mask, ir_amp, vi_amp, vi_orig, vi_enhanced, curve_A = fuse_net(data_ir, data_vi)
 
                 # ============ Losses ============
                 content_loss = loss_grad_pixel(data_vi, data_ir, fus_data)
@@ -118,12 +123,18 @@ def train(cfg_path, wb_key):
 
                 saliency_loss = cal_saliency_loss(fus_data, data_ir, data_vi, mask)
                 fre_loss = cal_fre_loss(amp, pha, data_ir, data_vi, mask)
+                sf_loss = cal_sf_loss(fus_data)
+                freq_hf_loss = cal_freq_hf_loss(amp, ir_amp, vi_amp, high_mask)
+                enhance_loss = loss_enhance(vi_orig, vi_enhanced, curve_A)
 
                 # 根据累积步数调整损失值
                 total_loss = (cfg.coeff_content * content_loss +
                               cfg.coeff_ssim * ssim_loss +
                               cfg.coeff_saliency * saliency_loss +
-                              cfg.coeff_fre * fre_loss) / accumulation_steps
+                              cfg.coeff_fre * fre_loss +
+                              cfg.coeff_sf * sf_loss +
+                              cfg.coeff_freq_hf * freq_hf_loss +
+                              cfg.coeff_enhance * enhance_loss) / accumulation_steps
 
             # 使用scaler缩放损失并反向传播
             scaler.scale(total_loss).backward()
@@ -142,20 +153,27 @@ def train(cfg_path, wb_key):
             ssim_loss_meter.update(ssim_loss.item())
             saliency_loss_meter.update(saliency_loss.item())
             fre_loss_meter.update(fre_loss.item())
-            
-            # 清理变量以释放内存
-            del fus_data, amp, pha, content_loss, ssim_loss_v, ssim_loss_i
-            del ssim_loss, saliency_loss, fre_loss, total_loss
-            
-            iter_bar.set_description(f'Epoch {epoch+1}/{cfg.num_epochs}')
+            sf_loss_meter.update(sf_loss.item())
+            freq_hf_loss_meter.update(freq_hf_loss.item())
+            enhance_loss_meter.update(enhance_loss.item())
+
+            iter_bar.set_description(f'Epoch {epoch + 1}/{cfg.num_epochs}')
             iter_bar.set_postfix({
-                'total': f'{total_loss.item() * accumulation_steps:.4f}',
-                'cont': f'{content_loss.item():.3f}',
-                'ssim': f'{ssim_loss.item():.3f}',
-                'sal': f'{saliency_loss.item():.3f}',
-                'fre': f'{fre_loss.item():.3f}'
+                'total': f'{total_loss_meter.avg:.4f}',
+                'cont': f'{content_loss_meter.avg:.3f}',
+                'ssim': f'{ssim_loss_meter.avg:.3f}',
+                'sal': f'{saliency_loss_meter.avg:.3f}',
+                'fre': f'{fre_loss_meter.avg:.3f}',
+                'sf': f'{sf_loss_meter.avg:.3f}',
+                'enh': f'{enhance_loss_meter.avg:.3f}'
             })
-            
+
+            # 清理变量以释放内存
+            del fus_data, amp, pha, high_mask, ir_amp, vi_amp
+            del vi_orig, vi_enhanced, curve_A
+            del content_loss, ssim_loss_v, ssim_loss_i
+            del ssim_loss, saliency_loss, fre_loss, sf_loss, freq_hf_loss, enhance_loss, total_loss
+
         scheduler.step()
         torch.cuda.empty_cache()  # 在每个epoch结束后清理缓存
 
@@ -166,24 +184,30 @@ def train(cfg_path, wb_key):
             'ssim_loss': ssim_loss_meter.avg,
             'saliency_loss': saliency_loss_meter.avg,
             'fre_loss': fre_loss_meter.avg,
+            'sf_loss': sf_loss_meter.avg,
+            'freq_hf_loss': freq_hf_loss_meter.avg,
+            'enhance_loss': enhance_loss_meter.avg,
             'lr': optimizer.param_groups[0]['lr'],
         }
         runs.log(log_dict)
 
         print('*' * 70 + ' EPOCH FINISHED ' + '*' * 70)
         logging.info(
-            f'Epoch {epoch+1}/{cfg.num_epochs} | '
+            f'Epoch {epoch + 1}/{cfg.num_epochs} | '
             f'lr: {optimizer.param_groups[0]["lr"]:.2e} | '
             f'total: {total_loss_meter.avg:.4f} | '
             f'content: {content_loss_meter.avg:.3f} | '
             f'ssim: {ssim_loss_meter.avg:.3f} | '
             f'saliency: {saliency_loss_meter.avg:.3f} | '
-            f'fre: {fre_loss_meter.avg:.4f}'
+            f'fre: {fre_loss_meter.avg:.4f} | '
+            f'sf: {sf_loss_meter.avg:.4f} | '
+            f'hf: {freq_hf_loss_meter.avg:.4f} | '
+            f'enh: {enhance_loss_meter.avg:.4f}'
         )
 
         # ============ Save Checkpoint ============
         if (epoch + 1) % cfg.epoch_gap == 0 or (epoch + 1) == cfg.num_epochs:
-            save_path = os.path.join("models", f'{cfg.exp_name}_epoch{epoch+1}.pth')
+            save_path = os.path.join("models", f'{cfg.exp_name}_epoch{epoch + 1}.pth')
             os.makedirs("models", exist_ok=True)
             torch.save({'fuse_net': fuse_net.state_dict()}, save_path)
             logging.info(f'Checkpoint saved: {save_path}')

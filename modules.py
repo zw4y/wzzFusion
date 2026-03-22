@@ -21,31 +21,32 @@ def ifft2(amp, pha):
     return torch.abs(img).unsqueeze(1)
 
 
-# ========================== VIS 低光增强（Path B：暗区增强） ==========================
+# ========================== VIS 低光增强（Phase 4.3：升级版） ==========================
 class LowLightEnhance(nn.Module):
     """
-    Dark-region-only curve enhancement (Zero-DCE style, Path B)
-    - Pixel-wise soft dark mask
-    - Only enhances truly dark regions
-    - Preserves mid/bright edges (Qabf/SF friendly)
+    Dark-region-only curve enhancement (Zero-DCE style, upgraded)
+    - 加深加宽：5层64通道（原3层32通道）
+    - 残差连接防止梯度消失
+    - 返回增强前图像和 Alpha map 供自监督损失使用
     Assumes input in [0,1]
     """
     def __init__(self, curve_num: int = 8):
         super().__init__()
         self.curve_num = curve_num
         self.curve_net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(32, curve_num, 3, padding=1),
+            nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, curve_num, 3, padding=1),
             nn.Tanh()
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         # x: (B,1,H,W) in [0,1]
+        x_orig = x  # 保存增强前的图像
 
-        # ===== 核心修改：像素级暗区 soft mask =====
-        # x < 0.35 → 强增强
-        # x > 0.5  → 几乎不增强
+        # ===== 像素级暗区 soft mask =====
         dark_mask = torch.sigmoid(10.0 * (0.35 - x))
 
         A = self.curve_net(x) * dark_mask
@@ -53,7 +54,8 @@ class LowLightEnhance(nn.Module):
         for i in range(self.curve_num):
             out = out + A[:, i:i+1] * out * (1.0 - out)
 
-        return torch.clamp(out, 0.0, 1.0)
+        out = torch.clamp(out, 0.0, 1.0)
+        return out, x_orig, A
 
 
 # ========================== Tokenizer ==========================
@@ -113,9 +115,23 @@ class DMRM(nn.Module):
     def __init__(self, in_ch=1, out_ch=32, dim=64):
         super().__init__()
 
-        # ===== Stem =====
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, dim, 3, padding=1), nn.GELU(),
+        # ===== Edge detection (固定 Sobel 核，无参数) =====
+        sobel_x = torch.tensor([[-1., 0., 1.],
+                                 [-2., 0., 2.],
+                                 [-1., 0., 1.]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1., -2., -1.],
+                                 [ 0.,  0.,  0.],
+                                 [ 1.,  2.,  1.]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+        # ===== Modality-specific Stems (输入: 原图+边缘图 = 2通道) =====
+        self.ir_stem = nn.Sequential(
+            nn.Conv2d(in_ch * 2, dim, 3, padding=1), nn.GELU(),
+            nn.Conv2d(dim, dim, 3, padding=1), nn.GELU(),
+        )
+        self.vi_stem = nn.Sequential(
+            nn.Conv2d(in_ch * 2, dim, 3, padding=1), nn.GELU(),
             nn.Conv2d(dim, dim, 3, padding=1), nn.GELU(),
         )
 
@@ -154,9 +170,16 @@ class DMRM(nn.Module):
         frefus:   (B,out_ch,H,W)  frequency-domain fused features
         """
 
-        # ===== Stem features =====
-        ir_f = self.stem(ir)
-        vi_f = self.stem(vi)
+        # ===== Edge extraction (Phase 3.2) =====
+        sobel_x = self.sobel_x.to(dtype=ir.dtype)
+        sobel_y = self.sobel_y.to(dtype=ir.dtype)
+
+        ir_edge = F.conv2d(ir, sobel_x, padding=1).abs() + F.conv2d(ir, sobel_y, padding=1).abs()
+        vi_edge = F.conv2d(vi, sobel_x, padding=1).abs() + F.conv2d(vi, sobel_y, padding=1).abs()
+
+        # ===== Stem features (原图 + 边缘图拼接) =====
+        ir_f = self.ir_stem(torch.cat([ir, ir_edge], dim=1))
+        vi_f = self.vi_stem(torch.cat([vi, vi_edge], dim=1))
 
         # ===== Token similarity =====
         ir_tok, b, H, W = self.tokenizer(ir_f)
@@ -205,7 +228,7 @@ class DMRM(nn.Module):
 
         # ===== Output =====
         feat = self.out(f_spatial_refined) + self.res(ir)
-        return feat, feat
+        return feat
 
 
 # ========================== 频率域 DHLF ==========================
@@ -219,10 +242,16 @@ class DecoupledHLFuse(nn.Module):
             nn.Conv2d(2, 32, 3, padding=1), nn.GELU(),
             nn.Conv2d(32, 1, 3, padding=1), nn.Sigmoid()
         )
+        # VIS 高频门控（输出1通道 vi_gate）
         self.high_denoise = nn.Sequential(
             nn.Conv2d(2, 64, 3, padding=1), nn.GELU(),
             nn.Conv2d(64, 32, 3, padding=1), nn.GELU(),
-            nn.Conv2d(32, 2, 3, padding=1)
+            nn.Conv2d(32, 1, 3, padding=1)
+        )
+        # IR 高频门控（独立网络，替代硬编码衰减）
+        self.ir_high_gate = nn.Sequential(
+            nn.Conv2d(2, 32, 3, padding=1), nn.GELU(),
+            nn.Conv2d(32, 1, 3, padding=1), nn.Sigmoid()
         )
         self.pha_adjust = nn.Conv2d(2, 2, 3, padding=1, bias=False)
         self.refine = nn.Sequential(
@@ -250,14 +279,10 @@ class DecoupledHLFuse(nn.Module):
         fused_low = ir_low * low_weight + vi_low * (1 - low_weight)
 
         high_cat = torch.cat([vi_high, ir_high], dim=1)
-        gates = torch.sigmoid(self.high_denoise(high_cat))
-        vi_gate = gates[:, 0:1]
-        ir_suppress = gates[:, 1:2]
+        vi_gate = torch.sigmoid(self.high_denoise(high_cat))
+        ir_gate = self.ir_high_gate(high_cat)
 
-        ir_residual = ir_high * (1.0 - ir_suppress)
-        ir_residual = torch.clamp(ir_residual, max=0.06)
-        ir_residual = ir_residual * 0.05
-        ir_residual = F.avg_pool2d(ir_residual, 3, stride=1, padding=1) * 0.85
+        ir_residual = ir_high * ir_gate
 
         fused_high = vi_high * vi_gate + ir_residual
 
@@ -267,7 +292,7 @@ class DecoupledHLFuse(nn.Module):
 
         intensity = ifft2(fused_amp, fused_pha)
         frefus = self.refine(intensity)
-        return frefus, fused_amp, fused_pha
+        return frefus, fused_amp, fused_pha, high_mask
 
 
 # ========================== 融合头 ==========================
@@ -282,10 +307,14 @@ class FuseBlock(nn.Module):
             nn.Tanh()
         )
 
-    def forward(self, ir_f, vi_f, frefus):
-        x = torch.cat([ir_f, vi_f, frefus], dim=1)
+    def forward(self, spatial_f, frefus):
+        x = torch.cat([spatial_f, frefus], dim=1)
         out = self.net(x)
-        out = (out - out.min()) / (out.max() - out.min() + 1e-8)
+        # per-sample 归一化：每张图独立计算 min/max，训练与推理行为一致
+        b = out.shape[0]
+        out_min = out.view(b, -1).min(dim=1)[0].view(b, 1, 1, 1)
+        out_max = out.view(b, -1).max(dim=1)[0].view(b, 1, 1, 1)
+        out = (out - out_min) / (out_max - out_min + 1e-8)
         return out
 
 
@@ -297,13 +326,13 @@ class FusionNet(nn.Module):
         self.llie = LowLightEnhance(curve_num=8)
         self.dmrm = DMRM(in_ch=1, out_ch=channel)
         self.freq_fuse = DecoupledHLFuse(channel=channel)
-        self.fuse_block = FuseBlock(dim=channel * 3)
+        self.fuse_block = FuseBlock(dim=channel * 2)
 
     def forward(self, ir, vi):
-        vi = self.llie(vi)
+        vi_enhanced, vi_orig, curve_A = self.llie(vi)
         ir_amp, ir_pha = fft2(ir)
-        vi_amp, vi_pha = fft2(vi)
-        frefus, fused_amp, fused_pha = self.freq_fuse(ir_amp, ir_pha, vi_amp, vi_pha)
-        ir_feat, vi_feat = self.dmrm(ir, vi, frefus)
-        fusion = self.fuse_block(ir_feat, vi_feat, frefus)
-        return fusion, fused_amp, fused_pha
+        vi_amp, vi_pha = fft2(vi_enhanced)
+        frefus, fused_amp, fused_pha, high_mask = self.freq_fuse(ir_amp, ir_pha, vi_amp, vi_pha)
+        spatial_feat = self.dmrm(ir, vi_enhanced, frefus)
+        fusion = self.fuse_block(spatial_feat, frefus)
+        return fusion, fused_amp, fused_pha, high_mask, ir_amp, vi_amp, vi_orig, vi_enhanced, curve_A

@@ -29,8 +29,7 @@ def fuse(args):
     if not os.path.exists(fuse_out_folder):
         os.makedirs(fuse_out_folder)
 
-    # 根据checkpoint调整模型参数，从错误信息看应该是channel=32
-    fuse_net = FusionNet(channel=32)
+    fuse_net = FusionNet(channel=16)
     ckpt = torch.load(args.ckpt_path, map_location=device)
     fuse_net.load_state_dict(ckpt['fuse_net'])
     fuse_net.to(device)
@@ -54,7 +53,7 @@ def fuse(args):
             data_vi, data_ir = data_vi.to(device), data_ir.to(device)
 
             ts = time.time()
-            fus_data, _, _ = fuse_net(data_ir, data_vi)
+            fus_data, _, _, _, _, _, _, _, _ = fuse_net(data_ir, data_vi)
             # print(fus_data.shape)
             te = time.time()
             time_list.append(te - ts)
