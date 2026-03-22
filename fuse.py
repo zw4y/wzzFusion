@@ -54,7 +54,7 @@ def fuse(args):
 
             ts = time.time()
             fus_data, _, _, _, _, _, _, _, _ = fuse_net(data_ir, data_vi)
-            # print(fus_data.shape)
+            # print(fus_data.shape)1
             te = time.time()
             time_list.append(te - ts)
             if args.mode == 'gray':

@@ -77,7 +77,7 @@ class PixelGradLoss(nn.Module):
     """
     像素损失 + 方向感知多尺度梯度损失
     - 像素损失：L1(max(ir, vis), fused)  —— 不变
-    - 梯度损失：对 x/y 方向独立、在 3/5/7 三个尺度上分别计算
+    - 梯度损失：对 x/y 方向独立、在 3/5/7 三个尺度上分别计算1
     """
     def __init__(self):
         super().__init__()

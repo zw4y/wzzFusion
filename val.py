@@ -96,6 +96,7 @@ def evaluate(fuse_out_folder):
 
         en_val = Evaluator.EN(fi)
         # sd_val = Evaluator.SD(fi)
+        #1
         sf_val = Evaluator.SF(fi)
         ag_val = Evaluator.AG(fi)
         mi_val = Evaluator.MI(fi, ir, vi)
