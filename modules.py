@@ -110,8 +110,8 @@ class DetailFeatureExtraction(nn.Module):
         return torch.cat([z1, z2], dim=1)
 
 
-# ========================== 空间域 DMRM ==========================
-class DMRM(nn.Module):
+# ========================== 空间域 SASF ==========================
+class SASF(nn.Module):
     def __init__(self, in_ch=1, out_ch=32, dim=64):
         super().__init__()
 
@@ -324,7 +324,7 @@ class FusionNet(nn.Module):
         super().__init__()
         self.channel = channel
         self.llie = LowLightEnhance(curve_num=8)
-        self.dmrm = DMRM(in_ch=1, out_ch=channel)
+        self.sasf = SASF(in_ch=1, out_ch=channel)
         self.freq_fuse = DecoupledHLFuse(channel=channel)
         self.fuse_block = FuseBlock(dim=channel * 2)
 
@@ -333,6 +333,6 @@ class FusionNet(nn.Module):
         ir_amp, ir_pha = fft2(ir)
         vi_amp, vi_pha = fft2(vi_enhanced)
         frefus, fused_amp, fused_pha, high_mask = self.freq_fuse(ir_amp, ir_pha, vi_amp, vi_pha)
-        spatial_feat = self.dmrm(ir, vi_enhanced, frefus)
+        spatial_feat = self.sasf(ir, vi_enhanced, frefus)
         fusion = self.fuse_block(spatial_feat, frefus)
         return fusion, fused_amp, fused_pha, high_mask, ir_amp, vi_amp, vi_orig, vi_enhanced, curve_A
