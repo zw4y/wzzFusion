@@ -12,7 +12,7 @@ wandb_mode: online
 #5e4032d1bef2be6bef054322cead08c46606c50f
 start_epoch : 0
 num_epochs : 200
-epoch_gap : 50
+epoch_gap : 200
 batch_size : 4
 num_workers : 0
 lr_i : 5.0e-4
