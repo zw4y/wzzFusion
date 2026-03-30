@@ -23,3 +23,6 @@ coeff_content: 1
 coeff_ssim: 1
 coeff_saliency: 10
 coeff_fre: 1
+coeff_sf: 0.5
+coeff_freq_hf: 7
+coeff_enhance: 1
