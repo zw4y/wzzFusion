@@ -3,13 +3,12 @@ dataset_name : MSRS
 seed : 3407
 have_seg_label : False
 project_name : SFDFusion
-exp_name : model-MSRS_ChannelFixed
+exp_name : model-MSRS_cosine
 resume : ~
 img_size : 320
 
 log_level : INFO
 wandb_mode: online
-#5e4032d1bef2be6bef054322cead08c46606c50f
 start_epoch : 0
 num_epochs : 200
 epoch_gap : 200
