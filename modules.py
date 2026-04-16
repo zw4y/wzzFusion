@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 
 # ========================== 正确的完整 FFT ==========================
@@ -58,19 +57,6 @@ class LowLightEnhance(nn.Module):
         return out, x_orig, A
 
 
-# ========================== Tokenizer ==========================
-class Tokenizer(nn.Module):
-    def __init__(self, patch_size=3):
-        super().__init__()
-        self.unfold = nn.Unfold(kernel_size=patch_size, stride=1, padding=patch_size // 2)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        tokens = self.unfold(x)
-        tokens = tokens.transpose(1, 2)
-        return tokens, b, h, w
-
-
 # ========================== INN Detail Refinement ==========================
 class DetailNode(nn.Module):
     def __init__(self, dim=64):
@@ -110,7 +96,247 @@ class DetailFeatureExtraction(nn.Module):
         return torch.cat([z1, z2], dim=1)
 
 
-# ========================== 空间域 SASF ==========================
+# ========================== Swin Cross-Attention 模块 ==========================
+
+def window_partition(x, window_size):
+    """
+    将特征图划分为不重叠的窗口
+    Args:
+        x: (B, H, W, C)
+        window_size: int
+    Returns:
+        windows: (B * num_windows, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    """
+    将窗口还原为特征图
+    Args:
+        windows: (B * num_windows, window_size, window_size, C)
+        window_size: int
+        H, W: 特征图高宽
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class WindowCrossAttention(nn.Module):
+    """
+    窗口内的 Cross-Attention
+    query_feat 出 Q，context_feat 出 K/V
+    包含可学习的相对位置编码
+    """
+    def __init__(self, dim, num_heads=4, window_size=8):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.window_size = window_size
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.kv_proj = nn.Linear(dim, dim * 2)
+        self.out_proj = nn.Linear(dim, dim)
+
+        # ===== 相对位置编码 =====
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
+        )
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+        # 计算相对位置索引
+        coords_h = torch.arange(window_size)
+        coords_w = torch.arange(window_size)
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))  # (2, ws, ws)
+        coords_flat = coords.view(2, -1)  # (2, ws*ws)
+        relative_coords = coords_flat[:, :, None] - coords_flat[:, None, :]  # (2, N, N)
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # (N, N, 2)
+        relative_coords[:, :, 0] += window_size - 1
+        relative_coords[:, :, 1] += window_size - 1
+        relative_coords[:, :, 0] *= 2 * window_size - 1
+        relative_position_index = relative_coords.sum(-1)  # (N, N)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+    def forward(self, query_feat, context_feat):
+        """
+        Args:
+            query_feat:   (B*num_windows, window_size*window_size, dim)
+            context_feat: (B*num_windows, window_size*window_size, dim)
+        Returns:
+            out: (B*num_windows, window_size*window_size, dim)
+        """
+        Bw, N, C = query_feat.shape
+
+        q = self.q_proj(query_feat).reshape(Bw, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        kv = self.kv_proj(context_feat).reshape(Bw, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        # 加入相对位置偏置
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ].view(N, N, -1).permute(2, 0, 1)  # (num_heads, N, N)
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(Bw, N, C)
+        return self.out_proj(out)
+
+
+class CrossAttentionBlock(nn.Module):
+    """
+    双向 Cross-Attention + FFN
+    IR tokens attend to VI tokens，VI tokens attend to IR tokens
+    """
+    def __init__(self, dim, num_heads=4, window_size=8, mlp_ratio=2.0):
+        super().__init__()
+        self.norm_ir1 = nn.LayerNorm(dim)
+        self.norm_vi1 = nn.LayerNorm(dim)
+        self.cross_attn_ir = WindowCrossAttention(dim, num_heads, window_size)
+        self.cross_attn_vi = WindowCrossAttention(dim, num_heads, window_size)
+
+        self.norm_ir2 = nn.LayerNorm(dim)
+        self.norm_vi2 = nn.LayerNorm(dim)
+        mlp_hidden = int(dim * mlp_ratio)
+        self.ffn_ir = nn.Sequential(
+            nn.Linear(dim, mlp_hidden), nn.GELU(), nn.Linear(mlp_hidden, dim)
+        )
+        self.ffn_vi = nn.Sequential(
+            nn.Linear(dim, mlp_hidden), nn.GELU(), nn.Linear(mlp_hidden, dim)
+        )
+
+    def forward(self, ir_tokens, vi_tokens):
+        """
+        Args:
+            ir_tokens: (B*nW, N, dim)
+            vi_tokens: (B*nW, N, dim)
+        Returns:
+            ir_tokens, vi_tokens: 更新后的 tokens
+        """
+        # 双向 cross-attention
+        ir_normed = self.norm_ir1(ir_tokens)
+        vi_normed = self.norm_vi1(vi_tokens)
+        ir_cross = self.cross_attn_ir(ir_normed, vi_normed)   # IR query, VI context
+        vi_cross = self.cross_attn_vi(vi_normed, ir_normed)   # VI query, IR context
+        ir_tokens = ir_tokens + ir_cross
+        vi_tokens = vi_tokens + vi_cross
+
+        # FFN
+        ir_tokens = ir_tokens + self.ffn_ir(self.norm_ir2(ir_tokens))
+        vi_tokens = vi_tokens + self.ffn_vi(self.norm_vi2(vi_tokens))
+
+        return ir_tokens, vi_tokens
+
+
+class SwinCrossFusion(nn.Module):
+    """
+    Swin 风格的窗口 Cross-Attention 融合模块
+
+    特性：
+    - 窗口内双向 cross-attention（IR↔VI）
+    - Shifted window 实现跨窗口信息交换
+    - sim_map 通过交互后特征的余弦相似度计算（数值行为与原始版本一致）
+    - 相对位置编码，分辨率无关（训练320测试640无需适配）
+    """
+    def __init__(self, dim=64, num_heads=4, window_size=8, num_layers=2):
+        super().__init__()
+        self.window_size = window_size
+        self.num_layers = num_layers
+
+        self.blocks = nn.ModuleList([
+            CrossAttentionBlock(dim, num_heads, window_size) for _ in range(num_layers)
+        ])
+
+        # 融合投影：将 cross-attention 交互后的 IR/VI 特征合并
+        self.fuse_proj = nn.Conv2d(dim * 2, dim, 1)
+
+    def forward(self, ir_f, vi_f):
+        """
+        Args:
+            ir_f: (B, C, H, W) — IR stem 输出的特征
+            vi_f: (B, C, H, W) — VI stem 输出的特征
+        Returns:
+            f_spatial_raw: (B, C, H, W) — 融合后的空间特征
+            sim_map:       (B, 1, H, W) — 相似度图（交互后特征的余弦相似度）
+        """
+        B, C, H, W = ir_f.shape
+        ws = self.window_size
+
+        # ===== Padding（确保 H, W 能被 window_size 整除）=====
+        pad_h = (ws - H % ws) % ws
+        pad_w = (ws - W % ws) % ws
+        if pad_h > 0 or pad_w > 0:
+            ir_f = F.pad(ir_f, (0, pad_w, 0, pad_h))
+            vi_f = F.pad(vi_f, (0, pad_w, 0, pad_h))
+
+        _, _, Hp, Wp = ir_f.shape
+
+        # (B, C, H, W) → (B, H, W, C)
+        ir_x = ir_f.permute(0, 2, 3, 1).contiguous()
+        vi_x = vi_f.permute(0, 2, 3, 1).contiguous()
+
+        for i, blk in enumerate(self.blocks):
+            # 奇数层做 shifted window
+            shift = ws // 2 if i % 2 == 1 else 0
+
+            if shift > 0:
+                ir_shifted = torch.roll(ir_x, shifts=(-shift, -shift), dims=(1, 2))
+                vi_shifted = torch.roll(vi_x, shifts=(-shift, -shift), dims=(1, 2))
+            else:
+                ir_shifted = ir_x
+                vi_shifted = vi_x
+
+            # Window partition → (B*nW, ws*ws, C)
+            ir_windows = window_partition(ir_shifted, ws).view(-1, ws * ws, C)
+            vi_windows = window_partition(vi_shifted, ws).view(-1, ws * ws, C)
+
+            # Cross-attention
+            ir_windows, vi_windows = blk(ir_windows, vi_windows)
+
+            # Window reverse
+            ir_shifted = window_reverse(ir_windows.view(-1, ws, ws, C), ws, Hp, Wp)
+            vi_shifted = window_reverse(vi_windows.view(-1, ws, ws, C), ws, Hp, Wp)
+
+            # Reverse shift
+            if shift > 0:
+                ir_x = torch.roll(ir_shifted, shifts=(shift, shift), dims=(1, 2))
+                vi_x = torch.roll(vi_shifted, shifts=(shift, shift), dims=(1, 2))
+            else:
+                ir_x = ir_shifted
+                vi_x = vi_shifted
+
+        # (B, H, W, C) → (B, C, H, W)
+        ir_out = ir_x.permute(0, 3, 1, 2).contiguous()
+        vi_out = vi_x.permute(0, 3, 1, 2).contiguous()
+
+        # 去除 padding
+        if pad_h > 0 or pad_w > 0:
+            ir_out = ir_out[:, :, :H, :W]
+            vi_out = vi_out[:, :, :H, :W]
+
+        # 融合
+        f_spatial_raw = self.fuse_proj(torch.cat([ir_out, vi_out], dim=1))
+
+        # ===== sim_map: 交互后特征的逐像素余弦相似度 =====
+        # cross-attention 交互后的特征包含跨模态上下文信息
+        # 余弦相似度范围 [-1, 1]，与原始版本的 sim_map 数值行为一致
+        # SDM 和 INN 的 (1-sim_map) 和 conf 可以正常工作
+        sim_map = F.cosine_similarity(ir_out, vi_out, dim=1).unsqueeze(1)  # (B, 1, H, W)
+
+        return f_spatial_raw, sim_map
+
+
+# ========================== 空间域 SASF（Swin Cross-Attention 版）==========================
 class SASF(nn.Module):
     def __init__(self, in_ch=1, out_ch=32, dim=64):
         super().__init__()
@@ -135,19 +361,13 @@ class SASF(nn.Module):
             nn.Conv2d(dim, dim, 3, padding=1), nn.GELU(),
         )
 
-        self.tokenizer = Tokenizer(patch_size=3)
+        # ===== Swin Cross-Attention 融合 =====
+        self.cross_fusion = SwinCrossFusion(dim=dim, num_heads=4, window_size=8, num_layers=2)
 
-        # ===== Projection =====
-        self.vis_proj = nn.Conv2d(dim, dim, 1)
-        self.ir_proj = nn.Conv2d(dim, dim, 1)
-        self.joint_proj = nn.Conv2d(dim * 2, dim, 1)
-
-        # ===== Similarity-driven weight map =====
-        self.weight_map = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 1, 3, padding=1), nn.Sigmoid()
-        )
+        # ===== Learnable scalars =====
+        self.beta = nn.Parameter(torch.tensor(0.08))    # SDM weight
+        self.gamma = nn.Parameter(torch.tensor(0.08))   # Frequency guidance weight
+        self.tau = nn.Parameter(torch.tensor(0.4))       # Uncertainty threshold
 
         # ===== INN refinement =====
         self.inn_refine = DetailFeatureExtraction(num_layers=3, dim=dim)
@@ -156,50 +376,31 @@ class SASF(nn.Module):
         self.out = nn.Conv2d(dim, out_ch, 1)
         self.res = nn.Conv2d(in_ch, out_ch, 1)
 
-        # ===== Learnable scalars =====
-        self.beta = nn.Parameter(torch.tensor(0.08))    # SDM weight
-        self.gamma = nn.Parameter(torch.tensor(0.08))   # Frequency guidance weight
-        self.tau = nn.Parameter(torch.tensor(0.4))      # Uncertainty threshold
-
         # ===== Frequency alignment =====
         self.freq_align = nn.Conv2d(out_ch, dim, 1)
 
     def forward(self, ir, vi, frefus):
         """
-        ir, vi:   (B,1,H,W)
-        frefus:   (B,out_ch,H,W)  frequency-domain fused features
+        Args:
+            ir:     (B, 1, H, W) — 红外图像
+            vi:     (B, 1, H, W) — 可见光图像（已增强）
+            frefus: (B, out_ch, H, W) — 频率域融合特征
+        Returns:
+            feat:   (B, out_ch, H, W) — 空间域融合特征
         """
 
-        # ===== Edge extraction (Phase 3.2) =====
+        # ===== Edge extraction =====
         sobel_x = self.sobel_x.to(dtype=ir.dtype)
         sobel_y = self.sobel_y.to(dtype=ir.dtype)
 
         ir_edge = F.conv2d(ir, sobel_x, padding=1).abs() + F.conv2d(ir, sobel_y, padding=1).abs()
         vi_edge = F.conv2d(vi, sobel_x, padding=1).abs() + F.conv2d(vi, sobel_y, padding=1).abs()
 
-        # ===== Stem features (原图 + 边缘图拼接) =====
         ir_f = self.ir_stem(torch.cat([ir, ir_edge], dim=1))
         vi_f = self.vi_stem(torch.cat([vi, vi_edge], dim=1))
 
-        # ===== Token similarity =====
-        ir_tok, b, H, W = self.tokenizer(ir_f)
-        vi_tok, _, _, _ = self.tokenizer(vi_f)
-
-        ir_norm = F.normalize(ir_tok, dim=-1)
-        vi_norm = F.normalize(vi_tok, dim=-1)
-        sim = torch.sum(ir_norm * vi_norm, dim=-1, keepdim=True)
-        sim_map = sim.transpose(1, 2).reshape(b, 1, H, W)   # (B,1,H,W)
-
-        # ===== Branch weighting =====
-        vis_w = self.weight_map(sim_map)
-        ir_w = 1.0 - vis_w
-
-        vis_branch = self.vis_proj(vi_f) * vis_w
-        ir_branch = self.ir_proj(ir_f) * ir_w
-        joint_branch = self.joint_proj(torch.cat([ir_f, vi_f], dim=1))
-
-        f_spatial_raw = vis_branch + ir_branch + 0.5 * joint_branch
-
+        # Cross-attention 融合（核心，不变）
+        f_spatial_raw, sim_map = self.cross_fusion(ir_f, vi_f)
         # ===== SDM (difference injection only in low-sim regions) =====
         sdm = torch.abs(ir_f - vi_f)
         f_spatial = f_spatial_raw + self.beta * sdm * (1.0 - sim_map)
@@ -318,7 +519,7 @@ class FuseBlock(nn.Module):
         return out
 
 
-# ========================== 主网络 ==========================？
+# ========================== 主网络 ==========================
 class FusionNet(nn.Module):
     def __init__(self, channel=32):
         super().__init__()
