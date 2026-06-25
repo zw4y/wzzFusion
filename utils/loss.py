@@ -174,37 +174,33 @@ def cal_fre_loss(amp, pha, ir, vi, mask):
 
 class EnhanceLoss(nn.Module):
     """
-    低光增强自监督损失（基于 Zero-DCE）
-    包含三项：
-    - L_spa: 空间一致性损失，保持增强前后的局部结构
-    - L_exp: 曝光控制损失，约束暗区增强后的亮度
-    - L_TV:  全变分损失，约束曲线参数的平滑性
+    简化版低光增强自监督损失（保持原始三项约束）：
+    - L_spa: 空间一致性，保持增强前后的局部结构；
+    - L_exp: 曝光控制，仅在增强掩码响应区域约束亮度；
+    - L_TV: 曲线参数平滑，避免增强参数突变。
+
+    说明：
+    - 去掉 L_id_bright / L_mask_tv / L_mask_bright，避免损失项过多；
+    - enhance_mask 仅作为曝光损失权重使用，并 detach，防止 mask 通过变小逃避曝光约束。
     """
     def __init__(self, patch_size=16, mean_val=0.5):
         super().__init__()
         self.pool = nn.AvgPool2d(patch_size)
         self.mean_val = mean_val
 
-        # 空间一致性的四方向差分核（用 register_buffer 兼容 AMP）
         self.register_buffer('w_left',  torch.FloatTensor([[0,0,0],[-1,1,0],[0,0,0]]).view(1,1,3,3))
         self.register_buffer('w_right', torch.FloatTensor([[0,0,0],[0,1,-1],[0,0,0]]).view(1,1,3,3))
         self.register_buffer('w_up',    torch.FloatTensor([[0,-1,0],[0,1,0],[0,0,0]]).view(1,1,3,3))
         self.register_buffer('w_down',  torch.FloatTensor([[0,0,0],[0,1,0],[0,-1,0]]).view(1,1,3,3))
         self.spa_pool = nn.AvgPool2d(4)
 
-    def forward(self, vi_orig, vi_enhanced, curve_A):
-        """
-        vi_orig:     增强前的 VIS (B,1,H,W)
-        vi_enhanced: 增强后的 VIS (B,1,H,W)
-        curve_A:     曲线参数图 (B,curve_num,H,W)
-        """
-        # 兼容 AMP：同时转换 dtype 和 device
+    def forward(self, vi_orig, vi_enhanced, curve_A, enhance_mask=None):
         w_left = self.w_left.to(dtype=vi_orig.dtype, device=vi_orig.device)
         w_right = self.w_right.to(dtype=vi_orig.dtype, device=vi_orig.device)
         w_up = self.w_up.to(dtype=vi_orig.dtype, device=vi_orig.device)
         w_down = self.w_down.to(dtype=vi_orig.dtype, device=vi_orig.device)
 
-        # ===== L_spa: 空间一致性损失 =====
+        # ===== L_spa: spatial consistency =====
         org_pool = self.spa_pool(vi_orig)
         enh_pool = self.spa_pool(vi_enhanced)
 
@@ -225,14 +221,15 @@ class EnhanceLoss(nn.Module):
             (D_org_down - D_enh_down) ** 2
         )
 
-        # ===== L_exp: 曝光控制损失（只约束暗区）=====
-        dark_mask = torch.sigmoid(10.0 * (0.35 - vi_orig))
+        # ===== L_exp: exposure control on adaptive dark/enhanced regions =====
+        if enhance_mask is None:
+            enhance_mask = torch.sigmoid(10.0 * (0.35 - vi_orig))
+
         enh_mean = self.pool(vi_enhanced)
-        mask_mean = self.pool(dark_mask)
-        # 只在暗区计算曝光损失
+        mask_mean = self.pool(enhance_mask.detach())
         L_exp = torch.mean(mask_mean * (enh_mean - self.mean_val) ** 2)
 
-        # ===== L_TV: 曲线平滑性损失 =====
+        # ===== L_TV: curve smoothness =====
         b, c, h, w = curve_A.shape
         h_tv = torch.mean((curve_A[:, :, 1:, :] - curve_A[:, :, :h-1, :]) ** 2)
         w_tv = torch.mean((curve_A[:, :, :, 1:] - curve_A[:, :, :, :w-1]) ** 2)

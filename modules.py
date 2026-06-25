@@ -20,18 +20,27 @@ def ifft2(amp, pha):
     return torch.abs(img).unsqueeze(1)
 
 
-# ========================== VIS 低光增强（Phase 4.3：升级版） ==========================
+# ========================== VIS 低光增强（简化自适应 soft mask 版） ==========================
 class LowLightEnhance(nn.Module):
-    """
-    Dark-region-only curve enhancement (Zero-DCE style, upgraded)
-    - 加深加宽：5层64通道（原3层32通道）
-    - 残差连接防止梯度消失
-    - 返回增强前图像和 Alpha map 供自监督损失使用
-    Assumes input in [0,1]
-    """
-    def __init__(self, curve_num: int = 8):
+
+    def __init__(
+        self,
+        curve_num: int = 8,
+        base_tau: float = 0.35,
+        k: float = 10.0,
+        tau_min: float = 0.28,
+        tau_max: float = 0.45,
+        adapt_ratio: float = 0.25,
+    ):
         super().__init__()
         self.curve_num = curve_num
+        self.base_tau = base_tau
+        self.k = k
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.adapt_ratio = adapt_ratio
+
+        # 与原始版本保持一致：5层64通道，最后用 Tanh 预测曲线参数
         self.curve_net = nn.Sequential(
             nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True),
@@ -42,19 +51,36 @@ class LowLightEnhance(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        # x: (B,1,H,W) in [0,1]
-        x_orig = x  # 保存增强前的图像
+        # x: (B,1,H,W), in [0,1]
+        x_orig = x
 
-        # ===== 像素级暗区 soft mask =====
-        dark_mask = torch.sigmoid(10.0 * (0.35 - x))
+        # ============================================================
+        # 1) Image-level adaptive threshold
+        # ============================================================
+        # 图像越暗，tau 越高，使更多区域参与增强；
+        # 图像越亮，tau 越低，减少正常曝光区域的不必要增强。
+        illum_mean = x.mean(dim=(2, 3), keepdim=True).detach()
+        tau = self.base_tau + self.adapt_ratio * (self.base_tau - illum_mean)
+        tau = tau.clamp(self.tau_min, self.tau_max)
 
-        A = self.curve_net(x) * dark_mask
+        # ============================================================
+        # 2) Adaptive soft dark mask
+        # ============================================================
+        # 形式仍然接近原始公式 M = sigmoid(k * (tau - Ivi))，
+        # 区别是 tau 由每张图像的全局亮度自适应确定。
+        enhance_mask = torch.sigmoid(self.k * (tau - x))
+
+        # ============================================================
+        # 3) Curve enhancement
+        # ============================================================
+        A = self.curve_net(x) * enhance_mask
+
         out = x
         for i in range(self.curve_num):
-            out = out + A[:, i:i+1] * out * (1.0 - out)
+            out = out + A[:, i:i + 1] * out * (1.0 - out)
 
         out = torch.clamp(out, 0.0, 1.0)
-        return out, x_orig, A
+        return out, x_orig, A, enhance_mask
 
 
 # ========================== INN Detail Refinement ==========================
@@ -530,10 +556,10 @@ class FusionNet(nn.Module):
         self.fuse_block = FuseBlock(dim=channel * 2)
 
     def forward(self, ir, vi):
-        vi_enhanced, vi_orig, curve_A = self.llie(vi)
+        vi_enhanced, vi_orig, curve_A, enhance_mask = self.llie(vi)
         ir_amp, ir_pha = fft2(ir)
         vi_amp, vi_pha = fft2(vi_enhanced)
         frefus, fused_amp, fused_pha, high_mask = self.freq_fuse(ir_amp, ir_pha, vi_amp, vi_pha)
         spatial_feat = self.sasf(ir, vi_enhanced, frefus)
         fusion = self.fuse_block(spatial_feat, frefus)
-        return fusion, fused_amp, fused_pha, high_mask, ir_amp, vi_amp, vi_orig, vi_enhanced, curve_A
+        return fusion, fused_amp, fused_pha, high_mask, ir_amp, vi_amp, vi_orig, vi_enhanced, curve_A, enhance_mask

@@ -1,20 +1,12 @@
 from modules import *
 import os
 import numpy as np
-from utils.evaluator import Evaluator
 import torch
 from utils.img_read import *
 import logging
-from kornia.metrics import AverageMeter
 from tqdm import tqdm
 import warnings
-import yaml
-from configs import from_dict
-import dataset
-from torch.utils.data import DataLoader
-from thop import profile, clever_format
 import time
-import cv2
 import argparse
 
 warnings.filterwarnings("ignore")
@@ -36,27 +28,42 @@ def fuse(args):
     fuse_net.eval()
 
     time_list = []
+    img_names = os.listdir(args.ir_path)
 
-    img_names = [i for i in os.listdir(args.ir_path)]
-    ir_imgs = [img_read(os.path.join(args.ir_path, i), mode='L').unsqueeze(0) for i in img_names]
-    vi_imgs = [img_read(os.path.join(args.vi_path, i), mode='YCbCr')[0].unsqueeze(0) for i in img_names]
-    for idx, img in enumerate(ir_imgs):
-        _, _, h, w = img.shape
-        if h // 2 != 0 or w // 2 != 0:
-            ir_imgs[idx] = ir_imgs[idx][:, : h // 2 * 2, : w // 2 * 2]
-            vi_imgs[idx] = vi_imgs[idx][:, : h // 2 * 2, : w // 2 * 2]
-    data_list = zip(ir_imgs, vi_imgs, img_names)
     with torch.no_grad():
-        logging.info(f'fusing images ...')
-        iter = tqdm(data_list, total=len(img_names), ncols=80)
-        for data_ir, data_vi, img_name in iter:
+        logging.info(f'Fusing {len(img_names)} images in {args.mode} mode...')
+        iter_bar = tqdm(img_names, total=len(img_names), ncols=80)
+
+        for img_name in iter_bar:
+            # 1. 移入循环内部：按需读取，杜绝 OOM
+            data_ir = img_read(os.path.join(args.ir_path, img_name), mode='L').unsqueeze(0)
+
+            # 2. 截留色彩通道：兼容返回 (Y, CbCr) 元组的读取方式
+            vi_read = img_read(os.path.join(args.vi_path, img_name), mode='YCbCr')
+            if isinstance(vi_read, tuple) or isinstance(vi_read, list):
+                data_vi = vi_read[0].unsqueeze(0)
+                vi_cbcr = vi_read[1].unsqueeze(0)
+            else:
+                data_vi = vi_read.unsqueeze(0)
+                vi_cbcr = None  # 如果不是 tuple，说明 utils.img_read 被魔改过，需排查
+
+            # 对齐尺寸 (使用 ... 自动适配维度)
+            _, _, h, w = data_ir.shape
+            if h // 2 != 0 or w // 2 != 0:
+                data_ir = data_ir[..., : h // 2 * 2, : w // 2 * 2]
+                data_vi = data_vi[..., : h // 2 * 2, : w // 2 * 2]
+                if args.mode == 'RGB' and vi_cbcr is not None:
+                    vi_cbcr = vi_cbcr[..., : h // 2 * 2, : w // 2 * 2]
+
             data_vi, data_ir = data_vi.to(device), data_ir.to(device)
 
+            # 3. 前向推理
             ts = time.time()
             fus_data, _, _, _, _, _, _, _, _ = fuse_net(data_ir, data_vi)
-            # print(fus_data.shape)1
             te = time.time()
             time_list.append(te - ts)
+
+            # 4. 色彩重组与保存
             if args.mode == 'gray':
                 fi = np.squeeze((fus_data * 255).cpu().numpy()).astype(np.uint8)
                 img_save(fi, img_name, fuse_out_folder)
@@ -68,17 +75,14 @@ def fuse(args):
                 fi = fi.astype(np.uint8)
                 img_save(fi, img_name, fuse_out_folder, mode='RGB')
 
-    # logging.info(f'fusing images done!')
-    # logging.info(f'time: {np.round(np.mean(time_list[1:]), 6)}s')
-
 
 if __name__ == "__main__":
     parse = argparse.ArgumentParser()
-    parse.add_argument('--ckpt_path', type=str, default=f'models/model-MSRS_1215_epoch200.pth')
-    parse.add_argument('--ir_path', type=str, default='./RoadScene/test/ir/')
-    parse.add_argument('--vi_path', type=str, default='./RoadScene/test/vi/')
-    parse.add_argument('--out_dir', type=str, default=f'test_result/RoadScene_1215/')
-    parse.add_argument('--mode', type=str, default='gray')
+    parse.add_argument('--ckpt_path', type=str, default=f'models/model_lastest.pth')
+    parse.add_argument('--ir_path', type=str, default='./LLVIP_50pairs/test/ir/')
+    parse.add_argument('--vi_path', type=str, default='./LLVIP_50pairs/test/vi/')
+    parse.add_argument('--out_dir', type=str, default=f'test_result/LLVIP_50pairs')
+    parse.add_argument('--mode', type=str, default='RGB')
     args = parse.parse_args()
 
     fuse(args)

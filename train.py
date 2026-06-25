@@ -103,6 +103,10 @@ def train(cfg_path, wb_key):
         sf_loss_meter = AverageMeter()
         freq_hf_loss_meter = AverageMeter()
         enhance_loss_meter = AverageMeter()
+        llie_mask_mean_meter = AverageMeter()
+        llie_mask_max_meter = AverageMeter()
+        llie_mask_min_meter = AverageMeter()
+        llie_enh_delta_meter = AverageMeter()
 
         iter_bar = tqdm(trainloader, total=len(trainloader), ncols=100)
         for i, (data_ir, data_vi, mask, _) in enumerate(iter_bar):
@@ -112,7 +116,8 @@ def train(cfg_path, wb_key):
 
             # 使用autocast包装前向传播
             with autocast():
-                fus_data, amp, pha, high_mask, ir_amp, vi_amp, vi_orig, vi_enhanced, curve_A = fuse_net(data_ir, data_vi)
+                fus_data, amp, pha, high_mask, ir_amp, vi_amp, vi_orig, vi_enhanced, curve_A, enhance_mask = fuse_net(
+                    data_ir, data_vi)
 
                 # ============ Losses ============
                 content_loss = loss_grad_pixel(data_vi, data_ir, fus_data)
@@ -125,8 +130,7 @@ def train(cfg_path, wb_key):
                 fre_loss = cal_fre_loss(amp, pha, data_ir, data_vi, mask)
                 sf_loss = cal_sf_loss(fus_data)
                 freq_hf_loss = cal_freq_hf_loss(amp, ir_amp, vi_amp, high_mask)
-                enhance_loss = loss_enhance(vi_orig, vi_enhanced, curve_A)
-
+                enhance_loss = loss_enhance(vi_orig, vi_enhanced, curve_A, enhance_mask)
                 # 根据累积步数调整损失值
                 total_loss = (cfg.coeff_content * content_loss +
                               cfg.coeff_ssim * ssim_loss +
@@ -157,6 +161,12 @@ def train(cfg_path, wb_key):
             freq_hf_loss_meter.update(freq_hf_loss.item())
             enhance_loss_meter.update(enhance_loss.item())
 
+            with torch.no_grad():
+                llie_mask_mean_meter.update(enhance_mask.mean().item())
+                llie_mask_max_meter.update(enhance_mask.max().item())
+                llie_mask_min_meter.update(enhance_mask.min().item())
+                llie_enh_delta_meter.update(torch.mean(torch.abs(vi_enhanced - vi_orig)).item())
+
             iter_bar.set_description(f'Epoch {epoch + 1}/{cfg.num_epochs}')
             iter_bar.set_postfix({
                 'total': f'{total_loss_meter.avg:.4f}',
@@ -165,15 +175,16 @@ def train(cfg_path, wb_key):
                 'sal': f'{saliency_loss_meter.avg:.3f}',
                 'fre': f'{fre_loss_meter.avg:.3f}',
                 'sf': f'{sf_loss_meter.avg:.3f}',
-                'enh': f'{enhance_loss_meter.avg:.3f}'
+                'enh': f'{enhance_loss_meter.avg:.3f}',
+                'm_mean': f'{llie_mask_mean_meter.avg:.3f}',
+                'd_enh': f'{llie_enh_delta_meter.avg:.3f}'
             })
 
             # 清理变量以释放内存
             del fus_data, amp, pha, high_mask, ir_amp, vi_amp
-            del vi_orig, vi_enhanced, curve_A
+            del vi_orig, vi_enhanced, curve_A, enhance_mask
             del content_loss, ssim_loss_v, ssim_loss_i
             del ssim_loss, saliency_loss, fre_loss, sf_loss, freq_hf_loss, enhance_loss, total_loss
-
         scheduler.step()
         torch.cuda.empty_cache()  # 在每个epoch结束后清理缓存
 
@@ -187,6 +198,10 @@ def train(cfg_path, wb_key):
             'sf_loss': sf_loss_meter.avg,
             'freq_hf_loss': freq_hf_loss_meter.avg,
             'enhance_loss': enhance_loss_meter.avg,
+            'llie/mask_mean': llie_mask_mean_meter.avg,
+            'llie/mask_max': llie_mask_max_meter.avg,
+            'llie/mask_min': llie_mask_min_meter.avg,
+            'llie/enh_delta': llie_enh_delta_meter.avg,
             'lr': optimizer.param_groups[0]['lr'],
         }
         runs.log(log_dict)
@@ -202,7 +217,11 @@ def train(cfg_path, wb_key):
             f'fre: {fre_loss_meter.avg:.4f} | '
             f'sf: {sf_loss_meter.avg:.4f} | '
             f'hf: {freq_hf_loss_meter.avg:.4f} | '
-            f'enh: {enhance_loss_meter.avg:.4f}'
+            f'enh: {enhance_loss_meter.avg:.4f} | '
+            f'llie_mask_mean: {llie_mask_mean_meter.avg:.4f} | '
+            f'llie_mask_max: {llie_mask_max_meter.avg:.4f} | '
+            f'llie_mask_min: {llie_mask_min_meter.avg:.4f} | '
+            f'llie_enh_delta: {llie_enh_delta_meter.avg:.4f}'
         )
 
         # ============ Save Checkpoint ============？
