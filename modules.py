@@ -3,10 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ========================== 正确的完整 FFT ==========================
+# ========================== 中心化 FFT ==========================
 def fft2(x):
     x = x.squeeze(1)
     spec = torch.fft.fft2(x, norm='ortho')
+    spec = torch.fft.fftshift(spec, dim=(-2, -1))
     amp = torch.abs(spec).unsqueeze(1)
     pha = torch.angle(spec).unsqueeze(1)
     return amp, pha
@@ -16,6 +17,7 @@ def ifft2(amp, pha):
     real = amp.squeeze(1) * torch.cos(pha.squeeze(1))
     imag = amp.squeeze(1) * torch.sin(pha.squeeze(1))
     spec = torch.complex(real, imag)
+    spec = torch.fft.ifftshift(spec, dim=(-2, -1))
     img = torch.fft.ifft2(spec, norm='ortho')
     return torch.abs(img).unsqueeze(1)
 
@@ -489,9 +491,15 @@ class DecoupledHLFuse(nn.Module):
 
     def forward(self, ir_amp, ir_pha, vi_amp, vi_pha):
         b, _, h, w = ir_amp.shape
+        fy = 2.0 * torch.fft.fftshift(
+            torch.fft.fftfreq(h, device=ir_amp.device)
+        )
+        fx = 2.0 * torch.fft.fftshift(
+            torch.fft.fftfreq(w, device=ir_amp.device)
+        )
         yy, xx = torch.meshgrid(
-            torch.linspace(-1, 1, h, device=ir_amp.device),
-            torch.linspace(-1, 1, w, device=ir_amp.device),
+            fy,
+            fx,
             indexing='ij'
         )
         dist = torch.sqrt(xx ** 2 + yy ** 2)
